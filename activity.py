@@ -50,7 +50,9 @@ from sugar.graphics.combobox import ComboBox
 from sugar.graphics.toolbarbox import ToolbarBox, ToolbarButton
 from sugar.activity.widgets import ActivityToolbarButton
 from sugar.activity.widgets import StopButton
+from sugar.graphics.objectchooser import ObjectChooser
 
+from sugar import mime
 from sugar import profile
 
 import eye
@@ -66,10 +68,13 @@ import fft_mouth
 import waveform_mouth
 
 import face
+import photoface
 
 import voice as voice_model
 import brain
 import chat
+
+from faceselect import FaceSelector
 
 import espeak
 
@@ -83,6 +88,8 @@ ACCELEROMETER_DEVICE = '/sys/devices/platform/lis3lv02d/position'
 MODE_TYPE = 1
 MODE_BOT = 2
 MODE_CHAT = 3
+FACE_CARTOON = 1
+FACE_PHOTO = 2
 MOUTHS = [mouth.Mouth, fft_mouth.FFTMouth, waveform_mouth.WaveformMouth]
 NUMBERS = ['one', 'two', 'three', 'four', 'five']
 SLEEPY_EYES = sleepy.Sleepy
@@ -158,32 +165,33 @@ class SpeakActivity(activity.Activity):
         self._active_eyes = None
         self._active_number_of_eyes = None
         self._current_voice = None
+        self._face_type = FACE_CARTOON
 
         # make an audio device for playing back and rendering audio
         self.connect('notify::active', self._active_cb)
         self._cfg = {}
 
         # make a box to type into
-        hbox = gtk.HBox()
+        self._entry_box = gtk.HBox()
 
         if self._tablet_mode:
             self._entry = gtk.Entry()
-            hbox.pack_start(self._entry, expand=True)
+            self._entry_box.pack_start(self._entry, expand=True)
             talk_button = ToolButton('microphone')
             talk_button.set_tooltip(_('Speak'))
             talk_button.connect('clicked', self._talk_cb)
-            hbox.pack_end(talk_button, expand=False)
+            self._entry_box.pack_end(talk_button, expand=False)
         else:
             self._entrycombo = gtk.combo_box_entry_new_text()
             self._entrycombo.connect('changed', self._combo_changed_cb)
             self._entry = self._entrycombo.child
             self._entry.set_size_request(-1, style.GRID_CELL_SIZE)
-            hbox.pack_start(self._entrycombo, expand=True)
+            self._entry_box.pack_start(self._entrycombo, expand=True)
         self._entry.set_editable(True)
         self._entry.connect('activate', self._entry_activate_cb)
         self._entry.connect('key-press-event', self._entry_key_press_cb)
         self._entry.modify_font(pango.FontDescription(str='sans bold 24'))
-        hbox.show()
+        self._entry_box.show()
 
         self.face = face.View(fill_color=lighter)
         self.face.set_size_request(
@@ -191,28 +199,28 @@ class SpeakActivity(activity.Activity):
         self.face.show()
 
         # layout the screen
-        box = gtk.VBox(homogeneous=False)
+        self._box = gtk.VBox(homogeneous=False)
         if self._tablet_mode:
-            box.pack_start(hbox, expand=False)
-            box.pack_start(self.face)
+            self._box.pack_start(self._entry_box, expand=False)
+            self._box.pack_start(self.face)
         else:
-            box.pack_start(self.face, expand=True)
-            box.pack_start(hbox)
+            self._box.pack_start(self.face, expand=True)
+            self._box.pack_start(self._entry_box)
 
         self.add_events(gtk.gdk.POINTER_MOTION_HINT_MASK
                         | gtk.gdk.POINTER_MOTION_MASK)
         self.connect('motion_notify_event', self._mouse_moved_cb)
 
-        box.add_events(gtk.gdk.BUTTON_PRESS_MASK)
-        box.connect('button_press_event', self._mouse_clicked_cb)
+        self._box.add_events(gtk.gdk.BUTTON_PRESS_MASK)
+        self._box.connect('button_press_event', self._mouse_clicked_cb)
 
         # desktop
         self._notebook.show()
         self._notebook.props.show_border = False
         self._notebook.props.show_tabs = False
 
-        box.show_all()
-        self._notebook.append_page(box)
+        self._box.show_all()
+        self._notebook.append_page(self._box)
 
         self._chat = chat.View()
         self._chat.show_all()
@@ -362,8 +370,20 @@ class SpeakActivity(activity.Activity):
 
         current_voice = self.face.status.voice
 
-        status = self.face.status = \
-            face.Status().deserialize(self._cfg['status'])
+        type_ = self._cfg['face_type']
+        lighter = style.Color(self._colors[_lighter_color(self._colors)])
+        if type_ == self._face_type:
+            status = self.face.status = \
+                face.Status().deserialize(self._cfg['status'])
+        elif type_ == FACE_CARTOON:
+            self._set_face(face.View(fill_color=lighter), FACE_CARTOON)
+            status = self.face.status = \
+                face.Status().deserialize(self._cfg['status'])
+        else:
+            status = photoface.Status().deserialize(self._cfg['status'])
+            view = photoface.View(*status.get_args(), fill_color=lighter)
+            status = view.status
+            self._set_face(view, FACE_PHOTO)
 
         found_my_voice = False
         for name in self._voice_evboxes.keys():
@@ -410,6 +430,7 @@ class SpeakActivity(activity.Activity):
             history = [unicode(i[0], 'utf-8', 'ignore')
                        for i in self._entrycombo.get_model()]
         cfg = {'status': self.face.status.serialize(),
+               'face_type': self._face_type,
                'text': unicode(self._entry.props.text, 'utf-8', 'ignore'),
                'history': history, }
         file(file_path, 'w').write(json.dumps(cfg))
@@ -595,6 +616,24 @@ class SpeakActivity(activity.Activity):
     def _make_face_bar(self):
         facebar = gtk.Toolbar()
 
+        self._photo_face = ToolButton('face')
+        self._photo_face.set_tooltip(_('Set face from photo'))
+        self._photo_face.connect('clicked', self._photo_face_cb)
+        facebar.insert(self._photo_face, -1)
+        self._photo_face.show()
+
+        self._clear = ToolButton('edit-delete')
+        self._clear.set_tooltip(_('Clear photo face'))
+        self._clear.set_sensitive(False)
+        self._clear.connect('clicked', self._clear_photo_cb)
+        facebar.insert(self._clear, -1)
+        self._clear.show()
+
+        separator = gtk.SeparatorToolItem()
+        separator.set_draw(True)
+        separator.set_expand(False)
+        facebar.insert(separator, -1)
+
         self._mouth_type = []
         self._mouth_type.append(RadioToolButton(
             named_icon='mouth',
@@ -681,8 +720,64 @@ class SpeakActivity(activity.Activity):
         facebar.insert(number_of_eyes_palette_button, -1)
         number_of_eyes_palette_button.show()
 
+        self._cartoon_face_buttons = self._mouth_type + \
+            [eye_palette_button, number_of_eyes_palette_button]
+
         facebar.show_all()
         return facebar
+
+    def _photo_face_cb(self, widget):
+        chooser = ObjectChooser(parent=self,
+                                what_filter=mime.GENERIC_TYPE_IMAGE)
+
+        result = chooser.run()
+        if result == gtk.RESPONSE_ACCEPT:
+            jobject = chooser.get_selected_object()
+            if jobject and jobject.file_path:
+                selector = FaceSelector(jobject.file_path)
+                selector.connect('face-processed',
+                                 self._photo_face_processed_cb)
+                self._notebook.append_page(selector)
+                selector.show()
+
+                num = self._notebook.page_num(selector)
+                self._notebook.set_current_page(num)
+        chooser.destroy()
+                
+    def _photo_face_processed_cb(self, widget, *face_data):
+        lighter = style.Color(self._colors[_lighter_color(self._colors)])
+        self._set_face(photoface.View(*face_data, fill_color=lighter),
+                       FACE_PHOTO)
+        
+
+    def _set_face(self, view, type_):
+        self._face_type = type_
+
+        self._box.remove(self.face)
+        self._box.remove(self._entry_box)
+
+        self.face = view
+        self.face.set_size_request(
+            -1, gtk.gdk.screen_height() - 2 * style.GRID_CELL_SIZE)
+
+        if self._tablet_mode:
+            self._box.pack_start(self._entry_box, expand=False)
+            self._box.pack_start(self.face)
+        else:
+            self._box.pack_start(self.face, expand=True)
+            self._box.pack_start(self._entry_box)
+        self.face.show()
+        self._notebook.set_current_page(0)
+
+        cartoon = type_ == FACE_CARTOON
+        self._photo_face.set_sensitive(cartoon)
+        self._clear.set_sensitive(not cartoon)
+        for bnt in self._cartoon_face_buttons:
+            bnt.set_sensitive(cartoon)
+
+    def _clear_photo_cb(self, widget):
+        lighter = style.Color(self._colors[_lighter_color(self._colors)])
+        self._set_face(face.View(fill_color=lighter), FACE_CARTOON)
 
     def _face_palette_cb(self, button):
         palette = button.get_palette()
